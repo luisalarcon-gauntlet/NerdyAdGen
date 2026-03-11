@@ -1,0 +1,188 @@
+# MDC: Agents Module
+**Path:** `src/agents/`
+**Purpose:** V3 agent stubs — interfaces only. All raise `NotImplementedError` in V1.
+
+---
+
+## IMPORTANT: V1 Behavior
+
+All agents raise `NotImplementedError` in V1.
+The module exists to define interfaces and enforce cognitive boundaries.
+No agent logic runs until `PIPELINE_VERSION=v3`.
+
+In V1, the pipeline uses `src/generate/v1_generator.py` and `src/evaluate/judge.py` directly.
+
+---
+
+## Files
+
+```
+src/agents/
+├── __init__.py
+├── base.py           — BaseAgent with version check
+├── researcher.py     — ResearcherAgent stub
+├── writer.py         — WriterAgent stub
+├── editor.py         — EditorAgent stub
+├── evaluator.py      — EvaluatorAgent stub (will wrap evaluate module)
+├── orchestrator.py   — OrchestratorAgent stub
+└── models.py         — CreativeIntelligenceReport, HookPattern, OrchestratorResult
+```
+
+---
+
+## Agent Cognitive Boundaries
+
+These are the most important rules in this file. Each agent has exactly one cognitive task.
+
+```
+RESEARCHER  → competitive intelligence only. Never writes, edits, or evaluates copy.
+WRITER      → first-draft creation only. Never edits existing copy.
+EDITOR      → targeted improvement only. Never creates from a blank brief.
+EVALUATOR   → quality judgment only. Never generates, edits, or suggests improvements.
+ORCHESTRATOR → routing and coordination only. Makes no creative or evaluative decisions.
+```
+
+### Model Assignments (non-negotiable)
+
+```
+Researcher  → gemini-1.5-flash
+Writer      → gemini-1.5-flash
+Editor      → gemini-1.5-flash
+Evaluator   → claude-sonnet-4-6    ← NEVER change this, even in V3
+Orchestrator → no LLM calls — pure coordination logic
+```
+
+---
+
+## Interface Definitions
+
+```python
+class BaseAgent(ABC):
+    version_required: ClassVar[str] = "v3"
+
+    def _check_version(self) -> None:
+        if settings.pipeline_version != self.version_required:
+            raise NotImplementedError(
+                f"{self.__class__.__name__} requires "
+                f"PIPELINE_VERSION={self.version_required}. "
+                f"Current: PIPELINE_VERSION={settings.pipeline_version}"
+            )
+
+
+class ResearcherAgent(BaseAgent):
+    async def research(
+        self,
+        brief: Brief,
+        competitor_ads: List[ScrapedAd],
+        historical_ads: List[Ad],
+    ) -> CreativeIntelligenceReport:
+        self._check_version()
+        # V3 implementation
+
+
+class WriterAgent(BaseAgent):
+    async def write(
+        self,
+        brief: Brief,
+        intelligence: CreativeIntelligenceReport,
+    ) -> Ad:
+        self._check_version()
+        # V3 implementation
+
+
+class EditorAgent(BaseAgent):
+    async def edit(
+        self,
+        ad: Ad,
+        evaluation: EvaluationResult,
+        strategy: RegenerationStrategy,
+        brief: Brief,
+    ) -> Ad:
+        self._check_version()
+        # V3 implementation
+
+
+class EvaluatorAgent(BaseAgent):
+    async def evaluate(
+        self,
+        ad: Ad,
+        profile: WeightProfile,
+    ) -> EvaluationResult:
+        self._check_version()
+        # V3 wraps src/evaluate/judge.py
+
+
+class OrchestratorAgent(BaseAgent):
+    async def run_brief(self, brief: Brief) -> OrchestratorResult:
+        self._check_version()
+        # V3 coordinates all other agents
+```
+
+---
+
+## Agent Data Models
+
+```python
+class CreativeIntelligenceReport(BaseModel):
+    brief_id:             str
+    winning_hooks:        List[HookPattern]
+    winning_ctas:         List[str]
+    emotional_angles:     List[str]
+    competitor_gaps:      List[str]
+    recommended_approach: str
+    confidence:           float
+    created_at:           str
+
+class HookPattern(BaseModel):
+    style:      str
+    example:    str
+    competitor: str
+    frequency:  int       # times observed across scraped ads
+
+class OrchestratorResult(BaseModel):
+    status:           str         # "published" / "abandoned" / "skipped"
+    ad:               Ad
+    evaluation:       EvaluationResult
+    attempts:         int
+    intelligence_used: bool
+    total_cost_usd:   float
+```
+
+---
+
+## Test Specification
+
+### `tests/unit/test_agents.py`
+
+```
+Version gating (all must raise NotImplementedError in V1)
+- ResearcherAgent.research() → NotImplementedError
+- WriterAgent.write()        → NotImplementedError
+- EditorAgent.edit()         → NotImplementedError
+- EvaluatorAgent.evaluate()  → NotImplementedError
+- OrchestratorAgent.run_brief() → NotImplementedError
+
+Interface compliance
+- ResearcherAgent is subclass of BaseAgent
+- WriterAgent is subclass of BaseAgent
+- EditorAgent is subclass of BaseAgent
+- EvaluatorAgent is subclass of BaseAgent
+- OrchestratorAgent is subclass of BaseAgent
+
+Model validation
+- CreativeIntelligenceReport with all required fields → valid
+- HookPattern with style, example, competitor, frequency → valid
+- OrchestratorResult status accepts "published", "abandoned", "skipped"
+- OrchestratorResult status rejects other strings → ValidationError
+```
+
+---
+
+## V3 Docker Architecture (reference only — not for V1)
+
+In V3 each agent becomes a separate Docker service. Interfaces defined here remain
+unchanged — only deployment topology changes.
+
+```
+orchestrator, researcher, writer, editor, evaluator, dashboard, db
+```

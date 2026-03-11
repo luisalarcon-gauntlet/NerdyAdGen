@@ -1,0 +1,162 @@
+# MDC: Utils Module
+**Path:** `src/utils/`
+**Purpose:** Cross-cutting concerns — retry, circuit breaker, token tracking, structured logging.
+
+---
+
+## Files
+
+```
+src/utils/
+├── __init__.py
+├── retry.py           — @with_retry exponential backoff decorator
+├── circuit_breaker.py — Per-service circuit breaker (one instance per external service)
+├── tracking.py        — @track_tokens decorator for cost capture
+├── logger.py          — Structured JSON event logger
+└── ids.py             — UUID4 generation utility
+```
+
+---
+
+## retry.py
+
+Exponential backoff with jitter on every external API call.
+
+```python
+@with_retry(max_attempts=3, base_delay=2.0, max_delay=60.0)
+
+# Delay formula:
+delay = min(base_delay * (2 ** attempt_number) + random(0, 1.0), max_delay)
+# attempt 1: 2 + jitter
+# attempt 2: 4 + jitter
+# attempt 3: 8 + jitter (capped at max_delay)
+```
+
+- Catches only specified exception types — others propagate immediately
+- Logs each retry attempt via `structured_logger` before sleeping
+- Does not retry on non-transient errors (e.g. auth failures, invalid input)
+
+---
+
+## circuit_breaker.py
+
+One circuit breaker instance per external service:
+
+```python
+SERVICES = ["gemini", "claude", "database", "langsmith", "nano_banana"]
+
+CIRCUIT_CONFIG = {
+    "failure_threshold": 5,     # consecutive failures → OPEN
+    "cooldown_seconds":  60,    # OPEN → HALF_OPEN after this
+    "success_to_close":  1,     # successes in HALF_OPEN → CLOSED
+}
+```
+
+State machine: `CLOSED → OPEN (after 5 failures) → HALF_OPEN (after 60s) → CLOSED or OPEN`
+
+**LangSmith special rule:** when LangSmith circuit is OPEN, log locally and continue.
+LangSmith is never in the critical path. Its failure never blocks ad generation.
+
+---
+
+## tracking.py
+
+Decorator that captures token usage from every API response and writes a `TokenUsageRecord`.
+
+Token extraction per provider:
+```python
+# Gemini
+input_tokens  = response.usage_metadata.prompt_token_count
+output_tokens = response.usage_metadata.candidates_token_count
+
+# Claude
+input_tokens  = response.usage.input_tokens
+output_tokens = response.usage.output_tokens
+```
+
+Cost delegated to `CostCalculator` from `src/models/metrics.py`.
+Record persisted to `token_usage` table via `AdLibrary`.
+
+---
+
+## logger.py
+
+Every event is one JSON object per line. Required fields on all events:
+
+```json
+{
+  "timestamp": "2025-01-15T14:32:00Z",
+  "event": "ad_published",
+  "level": "info"
+}
+```
+
+### Required Events
+
+```python
+EVENTS = {
+    "ad_generated":              {"ad_id", "brief_id", "attempt_number"},
+    "ad_evaluated":              {"ad_id", "weighted_score", "knockout_passed", "attempt_number"},
+    "ad_published":              {"ad_id", "final_score", "total_attempts", "total_cost_usd"},
+    "ad_abandoned":              {"ad_id", "brief_id", "failure_pattern", "total_attempts"},
+    "api_error":                 {"service", "error_type", "error_message", "attempt_number"},
+    "retry_attempt":             {"service", "attempt_number", "delay_seconds"},
+    "circuit_breaker_opened":    {"service", "consecutive_failures"},
+    "circuit_breaker_closed":    {"service"},
+    "human_review_escalated":    {"trigger_type", "urgency", "brief_id"},
+    "human_review_suppressed":   {"trigger_type", "reason"},
+    "iteration_cycle_complete":  {"cycle_number", "published_count", "abandoned_count", "avg_score"},
+    "batch_started":             {"run_id", "total_briefs"},
+    "batch_resumed":             {"run_id", "skipping_count"},
+    "ratchet_would_trigger":     {"current_threshold", "avg_score", "window_size"},
+}
+```
+
+Log file path: `settings.log_file_path` (default: `data/pipeline.log`)
+
+---
+
+## Test Specification
+
+### `tests/unit/test_failure_handling.py`
+
+```
+@with_retry decorator
+- success on first attempt → returns result, no retry
+- transient error on first attempt → retries
+- success on second attempt → returns result
+- three consecutive failures → raises original exception type
+- delay between attempt 1 and 2 >= base_delay (2.0s)
+- delay between attempt 2 and 3 >= base_delay * 2 (4.0s)
+- non-specified exception type → propagates immediately without retry
+
+Circuit breaker state machine
+- initial state → CLOSED
+- 5 consecutive failures → transitions to OPEN
+- 4 consecutive failures → remains CLOSED
+- OPEN circuit → rejects request immediately, raises CircuitOpenError
+- before cooldown_seconds → remains OPEN
+- after cooldown_seconds → transitions to HALF_OPEN
+- success in HALF_OPEN → transitions to CLOSED
+- failure in HALF_OPEN → transitions back to OPEN
+- successful call → resets consecutive_failure_count to 0
+
+Circuit breaker service isolation
+- gemini circuit opening does NOT affect claude circuit state
+- claude circuit opening does NOT affect database circuit state
+- each service has independent failure count
+
+Structured logger
+- ad_published event includes "ad_id" and "final_score" fields
+- ad_abandoned event includes "failure_pattern" field
+- api_error event includes "service", "error_type", "error_message" fields
+- all events include "timestamp" in ISO 8601 format
+- all events include "level" field
+- each log entry is valid JSON (parseable with json.loads)
+
+@track_tokens decorator
+- Gemini call → TokenUsageRecord with operation=GENERATION
+- Claude call → TokenUsageRecord with operation=EVALUATION
+- cost_usd in record matches CostCalculator.calculate() output
+- input_tokens and output_tokens match values from mock API response
+```

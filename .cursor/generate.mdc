@@ -1,0 +1,162 @@
+# MDC: Generate Module
+**Path:** `src/generate/`
+**Purpose:** Gemini-powered ad copy generation from resolved briefs.
+**Model:** `gemini-1.5-flash` (default) · `gemini-1.5-pro` (quality escalation only)
+
+---
+
+## Files
+
+```
+src/generate/
+├── __init__.py
+├── base.py           — Abstract BaseGenerator interface
+├── v1_generator.py   — Text-only Gemini generation
+├── v2_generator.py   — V2 stub: adds image prompt generation
+└── v3_generator.py   — V3 stub: delegates to WriterAgent
+```
+
+---
+
+## Interface Contract
+
+All versions implement the same interface. The iteration loop never knows which version it uses.
+
+```python
+class BaseGenerator(ABC):
+
+    @abstractmethod
+    async def generate(self, brief: Brief) -> Ad:
+        """Generate a complete ad from a fully resolved brief."""
+
+    @abstractmethod
+    async def regenerate(
+        self,
+        ad: Ad,
+        evaluation: EvaluationResult,
+        strategy: RegenerationStrategy
+    ) -> Ad:
+        """Regenerate ad targeting a specific weak dimension."""
+```
+
+---
+
+## Generation Prompt Requirements
+
+Every generation call must include in the prompt:
+
+1. **Brand voice block** — empowering, knowledgeable, approachable, results-focused; confident but not arrogant; lead with outcomes not features
+2. **Brief block** — all non-None resolved brief fields, structured clearly
+3. **Ad anatomy block** — primary text (≤ `brief.inferred.ad_length_target` chars), headline (5–8 words), description (20–30 words), CTA button
+4. **Hook style block** — specific instruction for the inferred hook style
+5. **Output format block** — return ONLY valid JSON matching exact schema, no preamble
+
+```python
+VALID_CTA_BUTTONS = [
+    "Learn More", "Sign Up", "Get Started", "Start Free Trial",
+    "Book Now", "Contact Us", "Apply Now", "Download"
+]
+```
+
+---
+
+## Regeneration Strategy Map
+
+Each dimension failure maps to a specific regeneration scope. The strategy determines what the regeneration prompt instructs the model to change:
+
+```python
+REGENERATION_STRATEGIES = {
+    "clarity":             RegenerationApproach.FULL_REWRITE,
+       # Clarity failures are structural — the whole message needs rethinking
+    "value_proposition":   RegenerationApproach.TARGETED,
+       # Add a specific number, outcome, or proof point
+    "cta":                 RegenerationApproach.TARGETED,
+       # Rewrite CTA only — preserve primary text
+    "brand_voice":         RegenerationApproach.TONE_REWRITE,
+       # Same structure, adjust empowerment and confidence of tone
+    "emotional_resonance": RegenerationApproach.HOOK_REWRITE,
+       # Rewrite first sentence only — preserve body and CTA
+}
+```
+
+Every regeneration prompt must include:
+- The original ad copy (for context)
+- Which dimension failed and what the score was
+- The previous evaluation rationale for that dimension
+- Explicit instruction to preserve dimensions that scored ≥ 7.0
+- Explicit instruction not to sacrifice other dimensions for the target
+
+---
+
+## Test Specification
+
+### `tests/unit/test_generator.py`
+
+```
+Interface compliance
+- V1Generator is instance of BaseGenerator
+- V2Generator.generate() → NotImplementedError
+- V3Generator.generate() → NotImplementedError
+
+V1Generator.generate()
+- returns Ad with all required fields populated
+- Ad.image_url is None (V1 text only)
+- Ad.brief_id matches input brief.brief_id
+- primary_text length ≤ brief.inferred.ad_length_target
+- cta_button value is in VALID_CTA_BUTTONS
+- prompt sent to Gemini includes brief.audience
+- prompt sent to Gemini includes brief.campaign_goal
+- prompt sent to Gemini includes brief.inferred.hook_style
+- malformed Gemini JSON response → GenerationError (not raw exception)
+- mocked passing Gemini response → parsed correctly into Ad model
+
+V1Generator.regenerate()
+- clarity failure → strategy approach is FULL_REWRITE
+- cta failure → strategy approach is TARGETED
+- emotional_resonance failure → strategy approach is HOOK_REWRITE
+- brand_voice failure → strategy approach is TONE_REWRITE
+- value_proposition failure → strategy approach is TARGETED
+- regeneration prompt includes original primary_text
+- regeneration prompt includes failed dimension name
+- regeneration prompt includes score for failed dimension
+- returned Ad has same brief_id as input Ad
+- returned Ad has same id as input Ad (same ad object, new copy)
+
+Prompt construction
+- optional brief fields present in prompt when not None
+- optional brief fields absent from prompt when None
+- FEAR hook style generates different prompt than ASPIRATION hook style
+- SOCIAL_PROOF hook prompt includes explicit instruction about proof elements
+```
+
+---
+
+## LangSmith + Tracking Decorators
+
+```python
+@traceable(name="generate_ad", run_type="llm", tags=["generation", "gemini"])
+@track_tokens(operation=OperationType.GENERATION, model="gemini-1.5-flash")
+@with_retry(max_attempts=3)
+async def generate(self, brief: Brief) -> Ad:
+    ...
+
+@traceable(name="regenerate_ad", run_type="llm", tags=["regeneration", "gemini"])
+@track_tokens(operation=OperationType.REGENERATION, model="gemini-1.5-flash")
+@with_retry(max_attempts=3)
+async def regenerate(self, ad: Ad, evaluation: EvaluationResult, strategy: RegenerationStrategy) -> Ad:
+    ...
+```
+
+---
+
+## V2 and V3 Stubs
+
+```python
+# v2_generator.py
+class V2Generator(BaseGenerator):
+    async def generate(self, brief: Brief) -> Ad:
+        raise NotImplementedError("V2 generator requires PIPELINE_VERSION=v2")
+
+    async def regenerate(self, ad: Ad, evaluation: EvaluationResult, strategy: RegenerationStrategy) -> Ad:
+        raise NotImplementedError("V2 generator requires PIPELINE_VERSION=v2")
+```

@@ -1,0 +1,158 @@
+# MDC: Output Module
+**Path:** `src/output/`
+**Purpose:** Ad library (all DB access), performance reporting, Plotly visualization.
+
+---
+
+## Files
+
+```
+src/output/
+├── __init__.py
+├── library.py      — AdLibrary: repository pattern — only place raw DB queries live
+├── reporter.py     — PerformanceReporter: metrics aggregation and export
+└── visualizer.py   — QualityTrendVisualizer: self-contained Plotly HTML report
+```
+
+---
+
+## library.py — AdLibrary
+
+Single access point for all database operations. Raw SQL lives nowhere else.
+All methods are `async`. Session management via context manager — never hold session open across `await` points.
+
+### Required Methods
+
+```python
+# Write
+async def save_ad(self, ad: Ad) -> None
+async def save_evaluation(self, evaluation: EvaluationResult) -> None
+async def save_iteration_record(self, record: IterationRecord) -> None
+async def save_token_usage(self, record: TokenUsageRecord) -> None
+async def save_failure_record(self, record: QualityFailureRecord) -> None
+async def mark_brief_complete(self, run_id: str, brief_id: str) -> None
+
+# Read
+async def get_ad(self, ad_id: str) -> Optional[Ad]
+async def get_publishable_ads(
+    self,
+    audience: Optional[str] = None,
+    campaign_goal: Optional[str] = None
+) -> List[Ad]
+async def get_completed_briefs(self, run_id: str) -> List[str]
+async def get_competitor_ads(self, competitor: Optional[str] = None) -> List[ScrapedAd]
+async def get_quality_trend(self, window: int = 10) -> List[dict]
+async def get_dimension_averages(self) -> dict
+async def get_cost_trend(self) -> List[dict]
+async def get_failure_patterns(self) -> dict
+async def get_performance_per_token(self) -> dict
+```
+
+### North Star Query — `get_performance_per_token()`
+
+Must return `quality_per_dollar` calculated as:
+
+```
+quality_per_dollar = avg_quality_score_of_published_ads
+                     ÷ (total_api_cost ÷ count_of_published_ads)
+```
+
+Abandoned ads contribute to `total_api_cost` but not to `count_of_published_ads`.
+
+---
+
+## reporter.py — PerformanceReporter
+
+### Export Methods
+
+```python
+async def export_json(self, output_path: str) -> None     # → reports/evaluation_report.json
+async def export_csv(self, output_path: str) -> None      # → reports/evaluation_report.csv
+async def generate_cost_report(self, output_path: str) -> None  # → reports/cost_report.json
+```
+
+### Cost Report Structure
+
+```json
+{
+  "north_star": {
+    "metric": "quality_per_dollar",
+    "value": 1306.67,
+    "interpretation": "Every $1 of API spend produces 1306 quality points across published ads"
+  },
+  "totals": {
+    "total_ads_generated": 72,
+    "total_ads_published": 51,
+    "total_api_cost_usd": 0.39,
+    "cost_per_published_ad_usd": 0.0076
+  },
+  "by_model": {
+    "gemini-1.5-flash": {"calls": 180, "cost_usd": 0.18},
+    "claude-sonnet-4-6": {"calls": 143, "cost_usd": 0.21}
+  }
+}
+```
+
+---
+
+## visualizer.py — QualityTrendVisualizer
+
+Single self-contained HTML file. No external CDN required — Plotly JS embedded.
+Default output: `reports/quality_trend.html`
+
+### Six Panels
+
+1. **Quality Score Over Cycles** — line chart, avg per cycle + min/max band + threshold line (dashed red)
+2. **Publish Rate Over Cycles** — line chart, % published per cycle
+3. **Dimension Score Radar** — polar chart, avg score per dimension across all published ads
+4. **Cost Per Published Ad** — line chart, should trend downward
+5. **Failure Pattern Distribution** — bar chart, count per `FailurePattern` across abandoned ads
+6. **Performance Summary Table** — key metrics including `quality_per_dollar`
+
+---
+
+## Test Specification
+
+### `tests/unit/test_output.py`
+
+```
+AdLibrary
+- save_ad persists ad to test database
+- save_ad with duplicate ad_id overwrites (upsert behavior)
+- get_ad returns None for non-existent id
+- get_publishable_ads returns only AdStatus.PUBLISHED ads
+- get_publishable_ads(audience="parent") returns only parent ads
+- get_publishable_ads(campaign_goal="conversion") returns only conversion ads
+- get_quality_trend returns list sorted by attempt_number ascending
+- get_performance_per_token returns dict with "quality_per_dollar" key
+- mark_brief_complete persists (run_id, brief_id) pair
+- get_completed_briefs returns correct brief_ids for run_id
+- get_completed_briefs returns empty list for unknown run_id
+
+PerformanceReporter
+- quality_per_dollar = avg_quality ÷ (total_cost ÷ published_count)
+- cost_per_published_ad = total_cost ÷ published_count
+- publish_rate = published_count ÷ total_generated_count
+- abandoned ads are included in total_cost
+- abandoned ads are NOT included in published_count
+- export_json writes valid JSON file
+- export_csv has header row
+- cost_report includes "north_star.quality_per_dollar" field
+- cost_report "north_star.interpretation" is a non-empty string
+```
+
+---
+
+## DB Session Pattern
+
+```python
+# Correct
+async with self.db_session() as session:
+    result = await session.execute(stmt)
+    return result.scalars().all()
+
+# Never — don't hold session open across unrelated awaits
+session = await self.get_session()
+result = await do_something_else()   # session still open — don't do this
+await session.execute(stmt)
+```

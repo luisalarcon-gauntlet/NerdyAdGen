@@ -1,0 +1,165 @@
+# MDC: Scraper Module
+**Path:** `src/scraper/`
+**Purpose:** Playwright scraping of the Meta Ad Library + calibration annotation CLI.
+
+---
+
+## Files
+
+```
+src/scraper/
+├── __init__.py
+├── playwright_scraper.py  — Playwright-based Meta Ad Library scraper
+├── ad_parser.py           — HTML field extraction and edge case handling
+└── calibration_cli.py     — CLI for manual quality annotation
+```
+
+---
+
+## Scraping Targets
+
+```python
+COMPETITOR_CONFIG = {
+    "princeton_review": {"search_term": "The Princeton Review",  "min": 20, "max": 50, "priority": 1},
+    "kaplan":           {"search_term": "Kaplan Test Prep",       "min": 20, "max": 50, "priority": 2},
+    "khan_academy":     {"search_term": "Khan Academy",           "min": 15, "max": 40, "priority": 3},
+    "chegg":            {"search_term": "Chegg",                  "min": 15, "max": 30, "priority": 4},
+}
+# Total target: 70–170 ads
+```
+
+---
+
+## Fields Per Ad
+
+```python
+class ScrapedAd(BaseModel):
+    ad_library_id:      str             # Meta's ad identifier — required
+    competitor:         str             # required
+    primary_text:       Optional[str]   # required OR headline must be present
+    headline:           Optional[str]
+    description:        Optional[str]
+    cta_button:         Optional[str]
+    platform:           Optional[str]
+    ad_format:          Optional[str]
+    is_active:          bool = True
+    raw_html:           str             # always stored for re-parsing
+    scraped_at:         str             # ISO 8601
+    carousel_id:        Optional[str]   # set when extracted from carousel
+    calibration_quality: Optional[str]  # None until annotated: "low"/"medium"/"high"
+    calibration_score:  Optional[float] # None until calibration runs
+```
+
+`primary_text` OR `headline` must be present — if both are None the ad is skipped.
+
+---
+
+## Edge Case Handling
+
+```
+Image-only ads     → skip, log event="scraper_skip", reason="no_copy_text"
+Non-English ads    → detect via langdetect; skip, log reason="non_english"
+                     if detection raises exception → keep the ad (default to include)
+Video ads          → include with calibration_note="video_ad_short_copy"
+Carousel ads       → extract each card as separate ScrapedAd with shared carousel_id
+```
+
+---
+
+## Respectful Scraping Config
+
+```python
+SCRAPING_CONFIG = {
+    "delay_between_requests": 2.0,   # seconds
+    "jitter":                 1.0,   # random(0, jitter) added to delay
+    "max_concurrent":         1,     # never scrape two competitors simultaneously
+    "retry_on_block":         False, # never push through a 429 or block
+    "headless":               True,
+    "store_raw_html":         True,
+}
+```
+
+---
+
+## Calibration CLI
+
+After scraping, a human must annotate a minimum of 20 ads before calibration passes.
+
+```bash
+python main.py annotate --competitor princeton_review
+# Presents each ad, prompts for: low / medium / high / skip
+# Saves annotation to calibration_quality field in reference_ads table
+
+python main.py calibrate --min-annotated 20
+# Runs judge against all annotated ads, checks agreement rate
+# Outputs: PASS / ADJUST [dimension] / HALT
+```
+
+### Calibration Bands
+
+```python
+CALIBRATION_BANDS = {
+    "low":    (0.0, 6.0),   # exclusive upper bound
+    "medium": (6.0, 7.5),
+    "high":   (7.5, 10.0),
+}
+```
+
+### Pass Criteria
+
+```
+Agreement ≥ 75%  → PASS — proceed to generation
+Agreement 50–74% → ADJUST — identify failing dimensions, update anchors, rerun
+Agreement < 50%  → HALT — rubric requires fundamental revision before continuing
+```
+
+---
+
+## Test Specification
+
+### `tests/unit/test_scraper.py`
+
+```
+Ad usability filter
+- ad with primary_text → is_usable=True
+- ad with only headline, no primary_text → is_usable=True
+- ad with neither primary_text nor headline → is_usable=False
+- is_usable=False → skip logged with reason="no_copy_text"
+
+Language detection
+- English primary_text → is_english=True
+- Spanish primary_text → is_english=False
+- non-English ad → skip logged with reason="non_english"
+- langdetect exception on detection → defaults to is_english=True (keep)
+
+ScrapedAd model validation
+- ad with ad_library_id and competitor and primary_text → valid
+- ad missing ad_library_id → ValidationError
+- ad missing competitor → ValidationError
+- calibration_quality defaults to None
+- calibration_score defaults to None
+
+Calibration score band classification (CALIBRATION_BANDS)
+- score 5.9 → "low"  (exclusive upper bound at 6.0)
+- score 6.0 → "medium" (inclusive lower bound)
+- score 7.4 → "medium"
+- score 7.5 → "high" (inclusive lower bound)
+- score 7.6 → "high"
+
+Calibration pass rate thresholds
+- 16 correct out of 20 annotated = 0.80 → PASS
+- 15 correct out of 20 annotated = 0.75 → PASS (boundary — inclusive)
+- 14 correct out of 20 annotated = 0.70 → ADJUST
+- 10 correct out of 20 annotated = 0.50 → HALT (boundary)
+- 9  correct out of 20 annotated = 0.45 → HALT
+- fewer than min_annotated_ads=20 → raises CalibrationError before running
+```
+
+---
+
+## Playwright Notes
+
+- Use `chromium` browser
+- `wait_for_load_state('networkidle')` after each search before extraction
+- Scroll detection: stop when ads_count_after_scroll == ads_count_before_scroll
+- Store Meta's internal ad identifier from `data-ad-id` attribute or equivalent DOM location

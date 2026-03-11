@@ -1,0 +1,201 @@
+# MDC: Evaluate Module
+**Path:** `src/evaluate/`
+**Purpose:** Claude-powered quality evaluation across five dimensions.
+**Model:** `claude-sonnet-4-6` — non-negotiable.
+
+---
+
+## Files
+
+```
+src/evaluate/
+├── __init__.py
+├── judge.py              — Main ClaudeJudge evaluation client
+├── rubrics.py            — Anchor-based rubric definitions per dimension
+├── aggregator.py         — Weighted scoring, knockout enforcement
+├── confidence.py         — Confidence scoring and high-confidence mode trigger
+├── conflict_detector.py  — Deterministic dimension conflict pattern detection
+└── dimensions/
+    ├── __init__.py
+    ├── clarity.py
+    ├── value_prop.py
+    ├── cta.py
+    ├── brand_voice.py
+    ├── emotional_resonance.py
+    └── visual.py          — V2 stub, raises NotImplementedError
+```
+
+---
+
+## Core Principle
+
+This module **only judges**. It never generates, edits, or suggests improvements.
+The judge prompt must include:
+1. Exact JSON schema to return
+2. Full anchor-based rubric for all five dimensions
+3. Weight profile context (audience, goal, description)
+4. Explicit instruction: "Score FROM the rubric anchors"
+5. Explicit instruction: "Return ONLY valid JSON — no preamble or explanation"
+
+The prompt must NOT ask for improvement suggestions or rewrites.
+
+---
+
+## Anchor-Based Rubrics
+
+Each dimension has three anchor bands. Anchors use VT SAT-specific examples.
+
+```
+Clarity anchors:
+  Low (1-4):    "Our experienced tutors are ready to help with all your academic needs"
+                — vague, no specific claim, anyone could say this
+  Medium (5-7): "Get expert SAT prep from certified tutors"
+                — clear category but generic benefit
+  High (8-10):  "Your daughter could score 200+ points higher in 8 weeks"
+                — single specific claim, quantified, understood in 2 seconds
+
+Value Proposition anchors:
+  Low (1-4):    "We have experienced tutors available for SAT prep"
+                — feature-focused, no outcome, no differentiation
+  Medium (5-7): "Varsity Tutors offers personalized SAT prep programs"
+                — mentions personalization but no proof or specifics
+  High (8-10):  "Students who prep with Varsity Tutors average 193-point SAT improvements"
+                — specific number, specific outcome, specific brand
+
+CTA anchors:
+  Low (1-4):    "Learn more" with no context, or no CTA at all
+  Medium (5-7): "Start your SAT prep today" — specific enough but low urgency
+  High (8-10):  "Get your free SAT score analysis — test is in 6 weeks"
+                — specific action, low friction, urgency grounded in real deadline
+
+Brand Voice anchors:
+  Low (1-4):    "Get better test scores with our affordable tutoring services"
+                — generic, could be any tutoring company, slightly transactional
+  Medium (5-7): "Personalized SAT prep that fits your schedule and goals"
+                — approachable but not distinctly empowering
+  High (8-10):  "You already have what it takes — let's unlock your best SAT score"
+                — empowering, knowledgeable tone, student-centered, results-focused
+
+Emotional Resonance anchors:
+  Parent frame:
+    Low (1-4):    "SAT prep courses available for your student"
+    Medium (5-7): "Worried about your child's SAT score? We can help"
+    High (8-10):  "Application deadlines don't wait. Neither should your student's score."
+  Student frame:
+    Low (1-4):    "Study for the SAT with our expert tutors"
+    Medium (5-7): "Stressed about the SAT? You're not alone"
+    High (8-10):  "Everyone else is already prepping. Where are you starting?"
+```
+
+---
+
+## Evaluation Modes
+
+### Fast Mode (default)
+- Single Claude call, `temperature=0.3` for consistency
+- Claude self-reports confidence per dimension (0.0–1.0)
+- Used when `abs(weighted_score - quality_threshold) > CONFIDENCE_BAND`
+
+### High Confidence Mode
+- Three Claude calls at `temperature=0.2`
+- Confidence = `1 - normalized_variance_across_runs`
+- Triggered when `abs(weighted_score - quality_threshold) <= CONFIDENCE_BAND` (default: 0.75)
+
+```python
+CONFIDENCE_BAND = 0.75
+HIGH_CONFIDENCE_RUNS = 3
+HIGH_CONFIDENCE_TEMPERATURE = 0.2
+```
+
+---
+
+## Conflict Detection (Deterministic — Not LLM)
+
+Computed from scores after evaluation. Three patterns:
+
+```
+Pattern 1: High resonance, low clarity
+  emotional_resonance >= 7.5 AND clarity <= 5.5
+  → Flag: "Great hook, unclear offer"
+
+Pattern 2: High clarity, low resonance
+  clarity >= 8.0 AND emotional_resonance <= 4.5
+  → Flag: "Crystal clear, but nobody cares"
+
+Pattern 3: Strong CTA, weak value prop
+  cta >= 7.5 AND value_proposition <= 5.0
+  → Flag: "Urgent ask with no reason to act"
+```
+
+---
+
+## Test Specification
+
+### `tests/unit/test_evaluation.py`
+
+```
+Weighted score calculation
+- weighted_score = sum(score × weight) for all 5 dimensions
+- uses profile weights, not equal weights
+- parent_conversion profile: manual calculation must match
+- dimension score outside 1.0-10.0 → ValueError
+
+Knockout enforcement (see exact profile values in models.mdc)
+- all scores above thresholds → knockout_passed=True
+- clarity=4.9, threshold=5.0 → knockout_passed=False
+- clarity=5.0 exactly → knockout_passed=True (inclusive lower bound)
+- two knockout failures → both dimension names in knockout_failures list
+- knockout_passed=False does not change weighted_score
+
+Confidence level classification
+- confidence > 0.80 → HIGH
+- confidence 0.60–0.80 → MEDIUM (0.80 is MEDIUM, not HIGH)
+- confidence < 0.60 → LOW (0.60 is LOW, not MEDIUM)
+
+High confidence mode trigger
+- abs(score - threshold) <= 0.75 → triggers 3-pass mode
+- abs(score - threshold) > 0.75 → uses single-pass mode
+- 3-pass mode runs exactly 3 evaluation calls
+
+Conflict detection
+- emotional_resonance=8.0, clarity=5.0 → DIMENSION_CONFLICT flagged
+- emotional_resonance=7.4, clarity=5.5 → no conflict (boundary — neither condition met)
+- clarity=8.5, emotional_resonance=4.0 → DIMENSION_CONFLICT flagged
+- cta=8.0, value_proposition=4.5 → DIMENSION_CONFLICT flagged
+- no conflict pattern met → empty flags list
+
+EvaluationResult.is_publishable property
+- knockout_passed=True, weighted_score=7.0 with threshold=7.0 → True
+- knockout_passed=False, weighted_score=9.0 → False (knockout overrides)
+- knockout_passed=True, weighted_score=6.9 with threshold=7.0 → False
+- requires_human_review=True → still returns is_publishable based on score/knockout
+
+EvaluationResult.weakest_dimension property
+- returns DimensionScore with the lowest score value
+- ties broken by first in list order
+```
+
+---
+
+## LangSmith Decorators
+
+```python
+@traceable(name="evaluate_ad", run_type="llm", tags=["evaluation", "claude"])
+@track_tokens(operation=OperationType.EVALUATION, model="claude-sonnet-4-6")
+@with_retry(max_attempts=3)
+async def evaluate(self, ad: Ad, profile: WeightProfile) -> EvaluationResult:
+    ...
+```
+
+---
+
+## V2 Visual Evaluation Stub
+
+```python
+# src/evaluate/dimensions/visual.py
+class VisualEvaluator:
+    async def evaluate(self, ad: Ad, image_url: str):
+        raise NotImplementedError(
+            "Visual evaluation activates in V2. Set PIPELINE_VERSION=v2."
+        )
+```

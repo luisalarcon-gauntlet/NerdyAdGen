@@ -1,0 +1,168 @@
+# MDC: Iterate Module
+**Path:** `src/iterate/`
+**Purpose:** Feedback loop orchestration — generate, evaluate, improve, repeat.
+
+---
+
+## Files
+
+```
+src/iterate/
+├── __init__.py
+├── loop.py           — Core generate → evaluate → improve cycle
+├── strategies.py     — RegenerationStrategy definitions per dimension
+├── tracker.py        — IterationTracker: oscillation and regression detection
+├── ratchet.py        — QualityRatchet: threshold management (active in V3 only)
+├── batch_runner.py   — Checkpointed batch execution over a list of briefs
+└── diagnosis.py      — QualityFailureHandler: classify and log abandoned ads
+```
+
+---
+
+## Tier Logic
+
+```
+Attempt 1–3  → Tier 1: Targeted regeneration (weakest dimension only)
+Attempt 4–5  → Tier 2: Full ad regeneration (carry forward what scored ≥ 7.0)
+Attempt 6    → Tier 3: Brief revision (reinterpret the brief from scratch)
+Attempt 7+   → Tier 4: Abandon — save failure diagnosis, move on
+```
+
+Tier escalation is automatic based on attempt number.
+**Exception:** oscillation detection escalates from Tier 1 to Tier 2 early.
+
+---
+
+## Oscillation Detection
+
+Definition: the same two weakest dimensions alternate across consecutive attempts.
+
+```
+Attempt 1 weakest: cta
+Attempt 2 weakest: emotional_resonance
+Attempt 3 weakest: cta              ← oscillation detected
+```
+
+Rule: requires minimum 3 attempts to detect. Two attempts never triggers it.
+Action: skip remaining Tier 1 attempts, immediately move to Tier 2 full rewrite.
+
+---
+
+## Regression Detection
+
+After every regeneration, check **all five dimensions** — not just the target.
+A dimension that drops more than `REGRESSION_THRESHOLD` (0.5 points) is a regression.
+
+Action: log regression in `IterationRecord.dimensions_regressed`.
+On next attempt: include all regressed dimensions explicitly in the regeneration instruction.
+
+---
+
+## Quality Ratchet
+
+**Stubbed in V1.** In V1, the ratchet logs when it would trigger but takes no action.
+
+```python
+RATCHET_CONFIG = {
+    "trigger_window":    10,    # Last N ads considered
+    "trigger_buffer":    0.5,   # Avg must exceed (threshold + buffer) to trigger
+    "increment":         0.1,   # Threshold increases by this amount per trigger
+    "minimum":           7.0,   # Never below brief-specified minimum
+    "maximum":           9.0,   # Never above this ceiling
+}
+```
+
+V3 activation: `PIPELINE_VERSION=v3`. In V1, `QualityRatchet.update()` logs
+`"would_trigger: True/False"` and returns without changing the threshold.
+
+---
+
+## Batch Runner
+
+Processes a list of briefs with checkpointing. Every completed ad (published or abandoned)
+is committed before the next brief starts. Interrupted runs resume from last checkpoint.
+
+Checkpoint key: `(run_id, brief_id)` stored in `batch_checkpoints` table via `AdLibrary`.
+
+Exception during a single brief → log as `"failed"`, continue to next brief.
+Never let one brief's failure stop the batch.
+
+---
+
+## Failure Diagnosis
+
+Three failure patterns saved when an ad is abandoned:
+
+```python
+class FailurePattern(str, Enum):
+    PERSISTENT_WEAKNESS = "persistent_weakness"
+        # Same dimension below 6.0 across all attempts
+    OSCILLATION         = "oscillation"
+        # Two dimensions alternating as weakest
+    STALLED_IMPROVEMENT = "stalled_improvement"
+        # Score improving but too slowly to reach threshold in remaining attempts
+```
+
+Abandoned ad status: `AdStatus.ABANDONED` — never deleted from the database.
+
+---
+
+## Test Specification
+
+### `tests/unit/test_iteration.py`
+
+```
+Tier assignment from attempt_number
+- attempt 1 → "targeted"
+- attempt 3 → "targeted"
+- attempt 4 → "full_rewrite"
+- attempt 5 → "full_rewrite"
+- attempt 6 → "brief_revision"
+- attempt 7 → "abandon"
+- attempt 10 → "abandon"
+
+Oscillation detection
+- weakest_dims = [cta, emotional_resonance, cta] → detected=True
+- weakest_dims = [cta, cta, cta] → detected=False (not two alternating)
+- weakest_dims = [cta, emotional_resonance, brand_voice] → detected=False
+- only 2 attempts → never detected (insufficient history)
+- oscillation detected → next tier is "full_rewrite" regardless of attempt_number
+
+Regression detection (REGRESSION_THRESHOLD = 0.5)
+- dimension drops 0.6 points → appears in dimensions_regressed
+- dimension drops exactly 0.5 points → does NOT appear (boundary is exclusive)
+- dimension drops 0.4 points → does NOT appear
+- dimension improves → does NOT appear
+- two regressions in same attempt → both appear in list
+
+Strategy selection per dimension
+- weakest="clarity"             → approach=FULL_REWRITE
+- weakest="cta"                 → approach=TARGETED
+- weakest="emotional_resonance" → approach=HOOK_REWRITE
+- weakest="brand_voice"         → approach=TONE_REWRITE
+- weakest="value_proposition"   → approach=TARGETED
+
+Quality ratchet (V1 stub behavior)
+- ratchet.update() does NOT change current_threshold in V1
+- ratchet.update() logs "would_trigger" event when condition is met
+- last 10 ads avg=8.0, threshold=7.0 → condition met (8.0 >= 7.0 + 0.5)
+- last 10 ads avg=7.4, threshold=7.0 → condition NOT met (7.4 < 7.0 + 0.5)
+- fewer than 10 ads in window → condition never met (insufficient data)
+```
+
+### `tests/unit/test_batch_runner.py`
+
+```
+Checkpointing
+- completed brief_id saved after each ad
+- resumed batch with 3 completed briefs skips those 3 brief_ids
+- new run_id starts fresh even if brief_ids were completed in another run
+
+Failure isolation
+- exception during brief → logged as "failed", batch continues
+- failed brief does not affect subsequent briefs
+- batch_result.failed includes the failed brief_id
+
+Batch result counts
+- published + abandoned + failed == total briefs processed
+```

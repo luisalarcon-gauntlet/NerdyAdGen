@@ -1,0 +1,179 @@
+# Cursor Rules — Nerdy Ad Engine
+
+## Project Identity
+
+Autonomous Facebook/Instagram ad copy generation pipeline for Varsity Tutors SAT prep.
+Gemini 1.5 Flash generates ad copy. Claude Sonnet 4.6 evaluates quality.
+The iteration loop regenerates weak ads and surfaces only publishable output.
+
+This project is AI-native end to end: scraping, generation, evaluation, iteration,
+documentation, and code are all produced with AI tooling. That is itself a design decision.
+
+---
+
+## Non-Negotiable Architecture Rules
+
+### Model Assignments
+| Task | Model | Rule |
+|---|---|---|
+| Ad copy generation | `gemini-1.5-flash` | Default. Escalate to `gemini-1.5-pro` after repeated failures |
+| Ad evaluation / judging | `claude-sonnet-4-6` | **Never swap. Never use Gemini here.** |
+| Image prompts (V2) | `gemini-1.5-flash` | V2 only |
+| Agent orchestration (V3) | `gemini-1.5-flash` | V3 only |
+
+**Claude is the judge. Always. Cost is not a justification to change this.**
+The entire quality system depends on generator and judge being different models.
+
+### Version Gating
+V2 and V3 features are **stubbed** — they exist as interfaces but raise `NotImplementedError`.
+Activation is controlled exclusively by `PIPELINE_VERSION` in `.env`.
+
+```python
+# Correct stub pattern
+class NanaBananaClient:
+    async def generate(self, ...):
+        raise NotImplementedError(
+            "Image generation activates in V2. Set PIPELINE_VERSION=v2."
+        )
+```
+
+Never activate a stub for a version that isn't set. Never remove a stub.
+
+### Separation of Concerns
+```
+src/generate/   → produces Ad objects. Never evaluates, never judges.
+src/evaluate/   → produces EvaluationResult objects. Never generates, never edits.
+src/iterate/    → orchestrates loop. Delegates to generate and evaluate. No LLM calls.
+src/output/     → reads DB, produces reports. No pipeline logic.
+src/models/     → Pydantic models only. Zero logic, zero imports from other src/ modules.
+src/utils/      → cross-cutting concerns only. No domain logic.
+src/config/     → settings and DB connection only. No pipeline logic.
+```
+
+---
+
+## Language and Stack
+
+- **Python 3.11+** — no exceptions
+- **Pydantic v2** — use `model_validator`, not `validator`; `model_validate()` not `parse_obj()`
+- **SQLAlchemy 2.0 async** — all DB access via repository pattern in `src/output/library.py`
+- **Alembic** — all schema changes via migrations. Never `CREATE TABLE` in application code.
+- **httpx** — REST API calls (Nano Banana)
+- **Playwright** — scraping only
+- **asyncio** throughout — no blocking calls
+
+---
+
+## Patterns That Must Be Used
+
+### Repository Pattern
+All database access goes through `AdLibrary` in `src/output/library.py`.
+Raw SQL never appears outside migration files.
+
+### Decorator Stack on Every LLM Call
+```python
+@traceable(name="...", run_type="llm")   # LangSmith — always first
+@track_tokens(operation=..., model=...)  # Cost tracking — always second
+@with_retry(max_attempts=3)              # Retry — always third
+async def call_llm(self, ...):
+    ...
+```
+
+If any decorator is missing from an LLM call, flag it.
+
+### ProfileRegistry for Weight Resolution
+```python
+# Correct
+profile = ProfileRegistry.resolve(audience="parent", campaign_goal="conversion")
+
+# Never — hardcoded weights
+weights = {"clarity": 0.20, "value_proposition": 0.30, ...}
+```
+
+### Settings for All Configuration
+```python
+# Correct
+from src.config.settings import settings
+threshold = settings.quality_threshold
+
+# Never — hardcoded values in pipeline code
+threshold = 7.0
+```
+
+---
+
+## Patterns That Must Never Appear
+
+- Raw SQL outside `migrations/`
+- Real API calls in unit tests
+- Database mocking in integration tests (use real test DB)
+- Magic numbers — use named constants or settings
+- `import *` anywhere
+- Business logic in route handlers or CLI entry points
+- Circular imports between `src/` modules
+- Comments that restate what the code does (only explain WHY)
+
+---
+
+## File Size Rule
+
+No file over 300 lines. If a module is growing past 300 lines, split it.
+A file that is hard to split is a design problem — flag it before continuing.
+
+---
+
+## Test-First Rule
+
+See `tdd.mdc` for the full AI-TDD workflow. Summary:
+1. Write tests before any implementation
+2. Present tests, wait for approval
+3. Implement until tests pass
+4. Never modify test logic to make tests pass — fix implementation
+
+---
+
+## Code Style
+
+```python
+# Type hints on every function
+async def generate(self, brief: Brief) -> Ad:
+
+# Docstrings on every class and public method — one line max unless complex
+class V1Generator:
+    """Generates ad copy via Gemini 1.5 Flash from a resolved Brief."""
+
+# f-strings only — no .format() or %
+message = f"Ad {ad.id} scored {score:.2f} — below threshold {threshold}"
+
+# Constants at module level in UPPER_SNAKE_CASE
+MAX_ITERATION_ATTEMPTS = 7
+CONFIDENCE_BAND = 0.75
+
+# async/await throughout — no time.sleep(), no synchronous HTTP
+await asyncio.sleep(delay)
+```
+
+---
+
+## Docker Rules
+
+- Every service has a `healthcheck`
+- App container depends on DB with `condition: service_healthy`
+- Alembic runs automatically before `main.py` on container start
+- DB data persisted via named volume — never anonymous volume
+- `.env` is gitignored — `.env.example` is always up to date
+
+---
+
+## Decision Log Rule
+
+When making an architectural choice that involves a meaningful tradeoff, add an entry
+to `docs/decision_log.md` in this format:
+
+```markdown
+### Entry N: [Decision Title]
+*"What was decided. Why over the alternative. What it unlocks for future versions."*
+```
+
+Entries should answer: What? Why not the alternative? What does it enable?
+Do not write defensive entries. Do not explain obvious choices.

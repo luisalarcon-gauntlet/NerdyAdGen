@@ -1,0 +1,239 @@
+# MDC: Config and Database
+**Paths:** `src/config/` · `migrations/`
+**Purpose:** All configuration, environment, database connection, and schema migrations.
+
+---
+
+## Files
+
+```
+src/config/
+├── __init__.py
+├── settings.py    — pydantic-settings Settings class (single source of truth)
+└── database.py    — async SQLAlchemy engine and session factory
+
+migrations/
+├── env.py                   — Alembic environment (auto-generated, do not edit)
+├── script.py.mako           — Migration template (auto-generated)
+└── versions/
+    └── 001_initial.py       — Full V1 schema
+```
+
+---
+
+## settings.py — All Fields
+
+```python
+class Settings(BaseSettings):
+
+    # API Keys
+    gemini_api_key:          str
+    anthropic_api_key:       str
+    langsmith_api_key:       str
+    nano_banana_api_key:     Optional[str] = None   # Required for V2
+
+    # Database
+    database_url:            str
+    database_url_test:       Optional[str] = None   # Required for integration tests
+
+    # LangSmith
+    langsmith_project:       str  = "nerdy-ad-engine"
+    langchain_tracing_v2:    bool = True
+    langsmith_enabled:       bool = True
+
+    # Pipeline behaviour
+    quality_threshold:       float = 7.0
+    max_iteration_attempts:  int   = 7
+    confidence_band:         float = 0.75
+    pipeline_version:        str   = "v1"     # "v1" | "v2" | "v3"
+
+    # Human review
+    human_review_enabled:             bool = True
+    human_review_urgency_minimum:     str  = "low"   # "low" | "medium" | "high"
+
+    # Logging
+    log_file_path:           str   = "data/pipeline.log"
+
+    # Scraping
+    scraping_delay_seconds:  float = 2.0
+    scraping_jitter_seconds: float = 1.0
+
+    class Config:
+        env_file = ".env"
+        env_file_encoding = "utf-8"
+        case_sensitive = False
+```
+
+---
+
+## Database Schema — V1 Tables
+
+```sql
+-- ads
+id TEXT PRIMARY KEY, brief_id TEXT, status TEXT,
+primary_text TEXT, headline TEXT, description TEXT, cta_button TEXT,
+image_url TEXT, image_prompt TEXT,   -- always NULL in V1
+final_score REAL, created_at TEXT, updated_at TEXT
+
+-- briefs
+id TEXT PRIMARY KEY, audience TEXT, campaign_goal TEXT, product TEXT,
+hook_style TEXT, platform TEXT, offer TEXT, urgency TEXT, social_proof TEXT,
+inferred_profile_id TEXT, inferred_length_target INT,
+created_at TEXT
+
+-- evaluations
+id TEXT PRIMARY KEY, ad_id TEXT, attempt_number INT,
+weighted_score REAL, knockout_passed BOOL, knockout_failures TEXT,  -- JSON array
+requires_human_review BOOL, flags TEXT,   -- JSON array
+confidence REAL, confidence_level TEXT,
+created_at TEXT
+
+-- dimension_scores
+id TEXT PRIMARY KEY, evaluation_id TEXT, dimension TEXT,
+score REAL, rationale TEXT, self_confidence REAL
+
+-- iterations
+id TEXT PRIMARY KEY, ad_id TEXT, attempt_number INT, tier TEXT,
+target_dimension TEXT, strategy TEXT,
+score_before REAL, score_after REAL,
+dimensions_improved TEXT,   -- JSON array
+dimensions_regressed TEXT,  -- JSON array
+oscillation_detected BOOL,
+cost_usd REAL, created_at TEXT
+
+-- token_usage
+id TEXT PRIMARY KEY, ad_id TEXT, brief_id TEXT,
+operation TEXT,   -- "generation" | "evaluation" | "regeneration" | "calibration" | "image_generation"
+provider TEXT, model TEXT,
+input_tokens INT, output_tokens INT, cost_usd REAL,
+created_at TEXT
+
+-- reference_ads  (scraped competitor ads)
+id TEXT PRIMARY KEY, ad_library_id TEXT UNIQUE, competitor TEXT,
+primary_text TEXT, headline TEXT, description TEXT, cta_button TEXT,
+platform TEXT, ad_format TEXT, is_active BOOL,
+carousel_id TEXT, raw_html TEXT,
+calibration_quality TEXT, calibration_score REAL,
+scraped_at TEXT
+
+-- batch_checkpoints
+run_id TEXT, brief_id TEXT,
+completed_at TEXT,
+PRIMARY KEY (run_id, brief_id)
+
+-- ratchet_history  (V3 stub — table exists in V1, never written to)
+id TEXT PRIMARY KEY, previous_threshold REAL, new_threshold REAL,
+trigger_avg_score REAL, window_size INT, created_at TEXT
+```
+
+---
+
+## docker-compose.yml (V1)
+
+```yaml
+version: "3.9"
+
+services:
+  app:
+    build: .
+    env_file: .env
+    depends_on:
+      db:
+        condition: service_healthy
+    command: >
+      sh -c "alembic upgrade head && python main.py run --mode v1"
+    volumes:
+      - ./data:/app/data
+      - ./reports:/app/reports
+
+  db:
+    image: postgres:15
+    environment:
+      POSTGRES_DB: ad_engine
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: postgres
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+
+volumes:
+  postgres_data:
+```
+
+---
+
+## .env.example
+
+```bash
+# ─────────────────────────────────────────────
+# NERDY AD ENGINE — ENVIRONMENT CONFIGURATION
+# Copy this file to .env and fill in your keys.
+# ─────────────────────────────────────────────
+
+# === REQUIRED FOR V1 ===
+GEMINI_API_KEY=your_gemini_api_key_here
+ANTHROPIC_API_KEY=your_anthropic_api_key_here
+LANGSMITH_API_KEY=your_langsmith_api_key_here
+
+DATABASE_URL=postgresql+asyncpg://postgres:postgres@db:5432/ad_engine
+DATABASE_URL_TEST=postgresql+asyncpg://postgres:postgres@db:5432/ad_engine_test
+
+# === REQUIRED FOR V2 ===
+NANO_BANANA_API_KEY=your_nano_banana_key_here
+
+# === LANGSMITH ===
+LANGSMITH_PROJECT=nerdy-ad-engine
+LANGCHAIN_TRACING_V2=true
+LANGSMITH_ENABLED=true
+
+# === PIPELINE BEHAVIOUR ===
+QUALITY_THRESHOLD=7.0
+MAX_ITERATION_ATTEMPTS=7
+CONFIDENCE_BAND=0.75
+PIPELINE_VERSION=v1
+
+# === HUMAN REVIEW ===
+HUMAN_REVIEW_ENABLED=true
+HUMAN_REVIEW_URGENCY_MINIMUM=low
+
+# === LOGGING ===
+LOG_FILE_PATH=data/pipeline.log
+
+# === SCRAPING ===
+SCRAPING_DELAY_SECONDS=2.0
+SCRAPING_JITTER_SECONDS=1.0
+```
+
+---
+
+## Test Specification
+
+### `tests/unit/test_config.py`
+
+```
+Settings loading and defaults
+- Settings loads from .env without error when all required keys present
+- Missing GEMINI_API_KEY → ValidationError
+- Missing ANTHROPIC_API_KEY → ValidationError
+- Missing DATABASE_URL → ValidationError
+- PIPELINE_VERSION not set → defaults to "v1"
+- QUALITY_THRESHOLD not set → defaults to 7.0
+- HUMAN_REVIEW_ENABLED not set → defaults to True
+- MAX_ITERATION_ATTEMPTS not set → defaults to 7
+
+Settings validation
+- HUMAN_REVIEW_URGENCY_MINIMUM="low"    → valid
+- HUMAN_REVIEW_URGENCY_MINIMUM="medium" → valid
+- HUMAN_REVIEW_URGENCY_MINIMUM="high"   → valid
+- HUMAN_REVIEW_URGENCY_MINIMUM="urgent" → ValidationError
+- PIPELINE_VERSION="v1" → valid
+- PIPELINE_VERSION="v2" → valid
+- PIPELINE_VERSION="v3" → valid
+- PIPELINE_VERSION="v4" → ValidationError
+- QUALITY_THRESHOLD=0.9 → ValidationError (must be >= 1.0)
+- QUALITY_THRESHOLD=10.1 → ValidationError (must be <= 10.0)
+```

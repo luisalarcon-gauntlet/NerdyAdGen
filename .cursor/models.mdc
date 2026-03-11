@@ -1,0 +1,239 @@
+# MDC: Models Module
+**Path:** `src/models/`
+**Purpose:** Pydantic data models only. Zero logic. Zero imports from other `src/` modules.
+
+---
+
+## Files
+
+```
+src/models/
+├── __init__.py
+├── ad.py           — Ad, AdStatus
+├── brief.py        — Brief, AudienceType, CampaignGoal, HookStyle, Platform
+├── evaluation.py   — EvaluationResult, DimensionScore, ConfidenceLevel, FlagType
+├── weights.py      — DimensionWeights, WeightProfile, KnockoutThresholds, ProfileRegistry
+├── metrics.py      — TokenUsageRecord, CostCalculator, PerformanceMetrics
+└── iteration.py    — IterationRecord, QualityFailureRecord, FailureDiagnosis, FailurePattern
+```
+
+---
+
+## Key Design Rules
+
+- `src/models/` has no imports from any other `src/` module — nothing
+- `Brief.inferred` is `None` until `resolve_inferred()` is called — call before passing to generator
+- `EvaluationResult.is_publishable` is a computed `@property` — not stored in DB
+- `EvaluationResult.weakest_dimension` is a computed `@property` returning the lowest-scoring `DimensionScore`
+- `Ad.image_url` and `Ad.image_prompt` are always `None` in V1 — nullable fields
+- `DimensionWeights` validator fires on `emotional_resonance` (last field declared) to check sum
+- `KnockoutThresholds` fields are `Optional[float]` — `None` means no knockout enforced for that dimension
+- All IDs are UUID4 strings generated at model creation via `default_factory=generate_id`
+- All timestamps are ISO 8601 UTC strings
+
+---
+
+## Weight Profiles — Exact Values
+
+```python
+# All four profiles must match these values exactly
+
+PARENT_CONVERSION = WeightProfile(
+    profile_id="vt_sat_parent_conversion",
+    audience="parent",
+    campaign_goal="conversion",
+    quality_threshold=7.5,
+    weights=DimensionWeights(
+        clarity=0.20,
+        value_proposition=0.30,
+        cta=0.25,
+        brand_voice=0.15,
+        emotional_resonance=0.10
+    ),
+    knockout_thresholds=KnockoutThresholds(
+        clarity=5.0,
+        cta=6.0,
+        brand_voice=5.0
+    )
+)
+
+STUDENT_CONVERSION = WeightProfile(
+    profile_id="vt_sat_student_conversion",
+    audience="student",
+    campaign_goal="conversion",
+    quality_threshold=7.5,
+    weights=DimensionWeights(
+        clarity=0.20,
+        value_proposition=0.25,
+        cta=0.30,
+        brand_voice=0.10,
+        emotional_resonance=0.15
+    ),
+    knockout_thresholds=KnockoutThresholds(
+        clarity=5.0,
+        cta=6.0
+    )
+)
+
+PARENT_AWARENESS = WeightProfile(
+    profile_id="vt_sat_parent_awareness",
+    audience="parent",
+    campaign_goal="awareness",
+    quality_threshold=7.0,
+    weights=DimensionWeights(
+        clarity=0.25,
+        value_proposition=0.25,
+        cta=0.15,
+        brand_voice=0.20,
+        emotional_resonance=0.15
+    ),
+    knockout_thresholds=KnockoutThresholds(
+        clarity=5.0,
+        brand_voice=5.0
+    )
+)
+
+STUDENT_AWARENESS = WeightProfile(
+    profile_id="vt_sat_student_awareness",
+    audience="student",
+    campaign_goal="awareness",
+    quality_threshold=7.0,
+    weights=DimensionWeights(
+        clarity=0.20,
+        value_proposition=0.20,
+        cta=0.25,
+        brand_voice=0.15,
+        emotional_resonance=0.20
+    ),
+    knockout_thresholds=KnockoutThresholds(
+        clarity=5.0,
+        cta=5.0
+    )
+)
+```
+
+---
+
+## Inferred Field Resolution Map
+
+```python
+# Hook style per audience + goal
+HOOK_STYLE_MAP = {
+    ("parent", "awareness"):   HookStyle.FEAR,
+    ("parent", "conversion"):  HookStyle.SOCIAL_PROOF,
+    ("student", "awareness"):  HookStyle.QUESTION,
+    ("student", "conversion"): HookStyle.STAT,
+}
+
+# Length target per platform (characters for primary text)
+LENGTH_TARGET_MAP = {
+    Platform.FACEBOOK_FEED:    125,
+    Platform.INSTAGRAM_FEED:   100,
+    Platform.INSTAGRAM_STORY:  75,
+    Platform.FACEBOOK_STORY:   75,
+}
+
+# Profile ID per audience + goal
+PROFILE_ID_MAP = {
+    ("parent", "conversion"):  "vt_sat_parent_conversion",
+    ("student", "conversion"): "vt_sat_student_conversion",
+    ("parent", "awareness"):   "vt_sat_parent_awareness",
+    ("student", "awareness"):  "vt_sat_student_awareness",
+}
+```
+
+---
+
+## Test Specification
+
+### `tests/unit/test_weights.py`
+
+```
+DimensionWeights validation
+- weights summing to exactly 1.0 → valid
+- weights summing to 0.99 → ValidationError
+- weights summing to 1.01 → ValidationError
+- any weight < 0 → ValidationError
+- a single weight of 0.0 → valid (allows disabling a dimension)
+
+KnockoutThresholds enforcement
+- all scores above thresholds → knockout_passed=True
+- clarity=4.9 with threshold=5.0 → knockout_passed=False, "clarity" in knockout_failures
+- clarity=5.0 exactly → knockout_passed=True (threshold is inclusive lower bound)
+- two dimensions below threshold → both appear in knockout_failures
+- knockout result does not affect weighted_score calculation — they are independent
+- KnockoutThresholds with all None → all ads pass knockout (no thresholds set)
+
+WeightProfile
+- profile with weights not summing to 1.0 → ValidationError at construction
+- profile without quality_threshold → defaults to 7.0
+- profile quality_threshold=7.5 stored correctly
+
+ProfileRegistry
+- register profile → resolvable by profile_id
+- exact audience+goal match → returns registered profile
+- unknown audience + known goal → returns base goal profile
+- unknown audience + unknown goal → returns base_equal profile
+- registering duplicate profile_id → overwrites previous
+- resolution is case-sensitive on audience and campaign_goal
+
+VarsityTutorsSATProfiles — check all four exist with correct values
+- PARENT_CONVERSION.quality_threshold == 7.5
+- STUDENT_CONVERSION.quality_threshold == 7.5
+- PARENT_AWARENESS.quality_threshold == 7.0
+- STUDENT_AWARENESS.quality_threshold == 7.0
+- all four profiles: weights sum to 1.0
+- PARENT_AWARENESS brand_voice knockout == 5.0
+- PARENT_CONVERSION cta knockout == 6.0
+- STUDENT_CONVERSION cta knockout == 6.0
+```
+
+### `tests/unit/test_brief.py`
+
+```
+Brief required field validation
+- Brief with audience + campaign_goal + product → valid
+- Brief missing audience → ValidationError
+- Brief missing campaign_goal → ValidationError
+- Brief missing product → ValidationError
+- audience="invalid" → ValidationError
+- campaign_goal="invalid" → ValidationError
+- valid audiences: "parent", "student"
+- valid campaign_goals: "awareness", "conversion", "retargeting"
+
+Brief.resolve_inferred()
+- parent + conversion → profile_id="vt_sat_parent_conversion"
+- student + awareness → profile_id="vt_sat_student_awareness"
+- brief without hook_style → hook inferred from HOOK_STYLE_MAP
+- parent + awareness → HookStyle.FEAR inferred
+- parent + conversion → HookStyle.SOCIAL_PROOF inferred
+- student + awareness → HookStyle.QUESTION inferred
+- student + conversion → HookStyle.STAT inferred
+- platform=FACEBOOK_FEED → ad_length_target=125
+- platform=INSTAGRAM_STORY → ad_length_target=75
+- platform=INSTAGRAM_FEED → ad_length_target=100
+- resolve_inferred() returns self (chainable)
+- calling resolve_inferred() twice does not change result
+
+CostCalculator
+- Claude Sonnet input cost matches anthropic rate per million tokens
+- Claude Sonnet output cost matches anthropic rate per million tokens
+- Gemini Flash input cost matches google rate per million tokens
+- Gemini Flash output cost matches google rate per million tokens
+- unknown model string → ValueError
+- total_cost = input_cost + output_cost
+```
+
+---
+
+## Import Pattern
+
+```python
+# Correct
+from src.models.ad import Ad, AdStatus
+from src.models.brief import Brief
+from src.models.evaluation import EvaluationResult, DimensionScore
+
+# Never
+from src.models import *
+```

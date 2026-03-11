@@ -1,0 +1,211 @@
+# Cursor Rules — AI-TDD Workflow
+
+## The Prime Directive
+
+**Write tests before implementation. Every time. No exceptions.**
+
+This is not a preference. It is the development contract for this entire project.
+Violating it produces implementation-coupled tests — tests that verify what code
+does rather than what it should do. That is not testing.
+
+---
+
+## The Exact Sequence
+
+For every feature, Cursor follows this order:
+
+### 1. Understand
+Read the feature description and the relevant `.cursor/mdc/` file completely.
+Identify what behaviors must exist — not how they will be implemented.
+
+### 2. Write Tests Only
+Write all failing tests. Stop.
+
+Tests must:
+- Cover the happy path
+- Cover at least two failure or edge cases
+- Cover boundary conditions (threshold values, empty inputs, max values)
+- Be runnable immediately — they fail, but they do not error on import
+
+### 3. Present and Wait
+Output ONLY the tests. No implementation code. End the response with:
+
+```
+Tests written for [feature]. Awaiting approval before implementation.
+Run: pytest [test_file_path] -v  ← all should fail
+```
+
+Do not proceed until explicit approval is given ("approved", "looks good", "go ahead").
+
+### 4. Implement
+Write the minimum code to make all tests pass.
+No extra features. No anticipatory code. No speculative abstractions.
+
+### 5. Confirm
+Show pytest output confirming all tests pass.
+If a test fails after implementation, fix implementation — never the test logic.
+
+---
+
+## What a Good Test Looks Like
+
+```python
+# GOOD — one behavior, descriptive name, no implementation knowledge required
+async def test_knockout_rejects_ad_with_clarity_below_threshold():
+    scores = build_dimension_scores(clarity=4.9)
+    profile = VarsityTutorsSATProfiles.PARENT_CONVERSION
+    result = apply_knockouts(scores, profile.knockout_thresholds)
+    assert result.knockout_passed is False
+    assert "clarity" in result.knockout_failures
+
+# BAD — tests implementation detail, not behavior
+async def test_knockout_calls_internal_check_method():
+    with patch.object(KnockoutChecker, '_check') as mock:
+        apply_knockouts(scores, profile.knockout_thresholds)
+        mock.assert_called_once()  # Testing the how, not the what
+```
+
+## What a Bad Test Looks Like
+
+- Mocks the thing being tested
+- Only verifies no exception was raised
+- Named `test_it_works` or `test_function_name`
+- Requires reading implementation to understand what it's testing
+- Passes before any implementation is written
+
+---
+
+## Naming Convention
+
+```python
+def test_[subject]_[condition]_[expected_result]():
+    ...
+
+# Examples
+def test_weights_summing_to_point_nine_nine_fails_validation():
+def test_registry_unknown_audience_returns_equal_weight_fallback():
+def test_circuit_breaker_opens_after_five_consecutive_failures():
+def test_quality_ratchet_never_exceeds_maximum_threshold():
+def test_oscillation_detected_when_same_two_dimensions_alternate():
+```
+
+---
+
+## Mocking Rules
+
+### Unit Tests — Mock Everything External
+```python
+@pytest.fixture
+def mock_gemini(mocker):
+    """Mock at the class level — not the function level."""
+    return mocker.patch(
+        'src.generate.v1_generator.GeminiClient',
+        return_value=AsyncMock(
+            generate=AsyncMock(return_value=MOCK_GOOD_AD_RESPONSE)
+        )
+    )
+
+@pytest.fixture
+def mock_claude(mocker):
+    return mocker.patch(
+        'src.evaluate.judge.ClaudeClient',
+        return_value=AsyncMock(
+            generate=AsyncMock(return_value=MOCK_PASSING_EVALUATION)
+        )
+    )
+```
+
+### Integration Tests — Mock APIs, Never Mock DB
+```python
+# Real database — always
+@pytest.fixture
+async def test_db():
+    engine = create_async_engine(settings.database_url_test)
+    async with engine.begin() as conn:
+        await conn.run_sync(Base.metadata.create_all)
+    yield AdLibrary(engine)
+    async with engine.begin() as conn:
+        await conn.run_sync(Base.metadata.drop_all)
+
+# Mocked APIs — always
+@pytest.fixture
+def mock_all_llm_clients(mock_gemini, mock_claude):
+    return mock_gemini, mock_claude
+```
+
+---
+
+## Test File Organization
+
+```
+tests/
+├── unit/
+│   ├── test_weights.py           # DimensionWeights, ProfileRegistry, knockouts
+│   ├── test_brief.py             # Brief validation, inferred fields, diversity
+│   ├── test_iteration.py         # Tier logic, oscillation, regression, ratchet
+│   ├── test_cost_tracking.py     # CostCalculator, TokenUsageRecord
+│   ├── test_failure_handling.py  # Retry, circuit breaker, failure diagnosis
+│   ├── test_human_review.py      # Gate, urgency filter, trigger conditions
+│   ├── test_evaluation.py        # Weighted scoring, confidence, conflict detection
+│   ├── test_generator.py         # Generation, regeneration strategies
+│   └── test_agents.py            # Version gating, interface completeness
+│
+├── integration/
+│   ├── test_pipeline_happy.py    # Full flow → ad published
+│   ├── test_pipeline_failure.py  # Full flow → ad abandoned after max attempts
+│   └── test_circuit_breaker.py   # Circuit breaker integration with pipeline
+│
+├── fixtures/
+│   ├── __init__.py
+│   ├── ads.py                    # Sample Ad objects
+│   ├── briefs.py                 # Sample Brief objects
+│   ├── evaluations.py            # Sample EvaluationResult objects
+│   ├── mock_responses.py         # Mock Gemini and Claude API responses
+│   └── database.py               # Test DB setup and teardown
+│
+└── calibration/
+    └── test_calibration.py       # Real API calls — run manually with -m calibration
+```
+
+---
+
+## When Tests Reveal Design Problems
+
+Hard-to-test code is a design signal, not a test problem.
+
+If writing tests requires:
+- Mocking more than 2 dependencies
+- Knowing implementation details to write the test
+- Setting up more than 5 lines of fixtures
+
+**Stop. Flag the design problem. Discuss before writing any implementation.**
+
+Fix the design first. Then write the tests.
+
+---
+
+## pytest Configuration
+
+```ini
+# pytest.ini
+[pytest]
+asyncio_mode = auto
+testpaths = tests
+python_files = test_*.py
+python_functions = test_*
+markers =
+    calibration: marks tests that make real API calls (run manually)
+addopts = -v --tb=short
+```
+
+---
+
+## The MDC Files Are Your Specs
+
+Before writing tests for any module, read the corresponding `.cursor/mdc/` file.
+Each MDC file contains the exact test specifications — behaviors written in plain English
+that translate directly into test function names and assertions.
+
+The MDC files are the source of truth for what each module must do.
+If a behavior isn't in the MDC file and wasn't explicitly discussed, flag it
+before adding tests or implementation for it.

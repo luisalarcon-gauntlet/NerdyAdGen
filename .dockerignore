@@ -1,0 +1,25 @@
+# Secrets — injected at runtime via docker-compose env_file, never baked into the image
+.env
+
+# Python cache
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.Python
+
+# Test artifacts
+.pytest_cache/
+.coverage
+htmlcov/
+
+# Local data and reports (mounted as volumes)
+data/
+reports/
+
+# Editor and OS
+.cursor/
+.vscode/
+*.swp
+.DS_Store
+Thumbs.db
